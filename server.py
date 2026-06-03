@@ -1300,9 +1300,17 @@ async def telegram_test():
     ok = await send_telegram(
         "✅ *Bot conectado correctamente*\n"
         "Las notificaciones funcionan.\n"
-        "Estás listo para empezar."
+        "Escribe /start para ver el menú con botones.",
+        reply_markup=MAIN_MENU,
     )
     return {"sent": ok}
+
+@api.post("/telegram/webhook")
+async def telegram_webhook(request: Request):
+    """Recibe updates de Telegram — botones y comandos."""
+    data = await request.json()
+    asyncio.create_task(process_telegram_update(data))
+    return {"ok": True}
 
 @api.post("/groq/test")
 async def groq_test():
