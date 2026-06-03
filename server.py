@@ -23,7 +23,7 @@ import httpx
 import pandas as pd
 import numpy as np
 from dotenv import load_dotenv
-from fastapi import FastAPI, APIRouter, HTTPException, BackgroundTasks
+from fastapi import FastAPI, APIRouter, HTTPException, BackgroundTasks, Request
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field, ConfigDict
@@ -687,9 +687,25 @@ async def evaluate_open_positions(tickers: dict, settings: Settings) -> List[Pos
 
     return closed
 
-# ── Telegram en español ──────────────────────────────────────────────────────
-async def send_telegram(message: str) -> bool:
-    # Lee directo de variables de entorno — no depende de MongoDB
+# ── Telegram en español con botones ──────────────────────────────────────────
+
+MAIN_MENU = {
+    "inline_keyboard": [
+        [
+            {"text": "▶️ Arrancar Bot", "callback_data": "start_bot"},
+            {"text": "🛑 Parar Bot",    "callback_data": "stop_bot"},
+        ],
+        [
+            {"text": "📊 Portfolio",    "callback_data": "portfolio"},
+            {"text": "📈 Señales",      "callback_data": "signals"},
+        ],
+        [
+            {"text": "⚡ PÁNICO — Cerrar Todo", "callback_data": "panic"},
+        ],
+    ]
+}
+
+async def send_telegram(message: str, reply_markup: dict = None) -> bool:
     token   = TELEGRAM_TOKEN
     chat_id = TELEGRAM_CHAT
     if not token or not chat_id:
@@ -697,19 +713,138 @@ async def send_telegram(message: str) -> bool:
         return False
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     try:
+        payload = {
+            "chat_id": chat_id,
+            "text": message,
+            "parse_mode": "Markdown",
+        }
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
         async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.post(
-                url,
-                json={
-                    "chat_id": chat_id,
-                    "text": message,
-                    "parse_mode": "Markdown",
-                },
-            )
+            r = await client.post(url, json=payload)
             return r.status_code == 200
     except Exception as exc:
         logger.warning("Error Telegram: %s", exc)
         return False
+
+async def answer_callback(callback_query_id: str, text: str = "") -> None:
+    token = TELEGRAM_TOKEN
+    if not token:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(
+                f"https://api.telegram.org/bot{token}/answerCallbackQuery",
+                json={"callback_query_id": callback_query_id, "text": text},
+            )
+    except Exception:
+        pass
+
+async def process_telegram_update(update: dict) -> None:
+    settings = await get_settings()
+    state    = await get_bot_state()
+
+    message = update.get("message", {})
+    text    = message.get("text", "")
+
+    if text in ("/start", "/menu"):
+        status = "🟢 Corriendo" if state.running else "🔴 Parado"
+        await send_telegram(
+            f"👋 *Hola! Soy tu bot de trading*\n\n"
+            f"Estado: {status}\n"
+            f"Modo: {'📄 Paper (simulado)' if settings.mode == 'paper' else '💰 Real'}\n"
+            f"Balance inicial: ${settings.starting_balance:,.2f}\n\n"
+            f"¿Qué quieres hacer?",
+            reply_markup=MAIN_MENU,
+        )
+        return
+
+    callback = update.get("callback_query", {})
+    cb_id    = callback.get("id", "")
+    cb_data  = callback.get("data", "")
+
+    if not cb_data:
+        return
+
+    if cb_data == "start_bot":
+        if state.circuit_breaker_tripped:
+            await answer_callback(cb_id, "⚠️ Circuit breaker activo")
+            await send_telegram("⚠️ *No se puede arrancar*\nCircuit breaker activo.", reply_markup=MAIN_MENU)
+            return
+        state.running    = True
+        state.started_at = now_iso()
+        await save_bot_state(state)
+        await answer_callback(cb_id, "✅ Bot arrancado")
+        await send_telegram(
+            "🟢 *Bot arrancado*\nAnalizando el mercado cada 5 minutos.\nTe avisaré cuando encuentre oportunidades.",
+            reply_markup=MAIN_MENU,
+        )
+
+    elif cb_data == "stop_bot":
+        state.running = False
+        await save_bot_state(state)
+        await answer_callback(cb_id, "🛑 Bot parado")
+        await send_telegram(
+            "🔴 *Bot parado*\nLas posiciones abiertas siguen activas.",
+            reply_markup=MAIN_MENU,
+        )
+
+    elif cb_data == "panic":
+        state.running = False
+        await save_bot_state(state)
+        tickers = await fetch_tickers(settings.symbols)
+        closed  = []
+        async for doc in db.positions.find({"status": "OPEN"}, {"_id": 0}):
+            pos = Position(**doc)
+            t   = tickers.get(pos.symbol)
+            if t:
+                c = await close_position(pos, t["price"], "⚡ Pánico manual")
+                closed.append(c)
+        await answer_callback(cb_id, "⚡ Pánico ejecutado")
+        msg = f"⚡ *PÁNICO EJECUTADO*\nBot parado. {len(closed)} posición(es) cerrada(s).\n"
+        for c in closed:
+            emoji = "✅" if (c.pnl or 0) >= 0 else "❌"
+            msg += f"{emoji} {c.symbol}: ${c.pnl:+.2f}\n"
+        await send_telegram(msg, reply_markup=MAIN_MENU)
+
+    elif cb_data == "portfolio":
+        open_docs   = await db.positions.find({"status": "OPEN"},   {"_id": 0}).to_list(100)
+        closed_docs = await db.positions.find({"status": "CLOSED"}, {"_id": 0}).to_list(1000)
+        realized    = sum((d.get("pnl") or 0) for d in closed_docs)
+        wins        = len([d for d in closed_docs if (d.get("pnl") or 0) > 0])
+        total       = len(closed_docs)
+        win_rate    = round(wins / total * 100, 1) if total else 0
+        equity      = settings.starting_balance + realized
+        ret_pct     = (realized / settings.starting_balance) * 100
+        status      = "🟢 Corriendo" if state.running else "🔴 Parado"
+        await answer_callback(cb_id, "📊 Cargando portfolio...")
+        await send_telegram(
+            f"📊 *Portfolio*\n\n"
+            f"Estado: {status}\n"
+            f"Balance inicial: ${settings.starting_balance:,.2f}\n"
+            f"Equity actual: ${equity:,.2f}\n"
+            f"P&L realizado: ${realized:+.2f} ({ret_pct:+.2f}%)\n"
+            f"Posiciones abiertas: {len(open_docs)}\n"
+            f"Total operaciones: {total}\n"
+            f"Win rate: {win_rate}%\n"
+            f"Pérdida diaria: {state.daily_loss_pct:.2f}% / {settings.circuit_breaker_pct}%",
+            reply_markup=MAIN_MENU,
+        )
+
+    elif cb_data == "signals":
+        cur  = db.signals.find({}, {"_id": 0}).sort("created_at", -1).limit(5)
+        sigs = await cur.to_list(length=5)
+        await answer_callback(cb_id, "📈 Últimas señales")
+        if not sigs:
+            await send_telegram("📈 *No hay señales todavía*", reply_markup=MAIN_MENU)
+            return
+        msg = "📈 *Últimas 5 señales*\n\n"
+        for s in sigs:
+            emoji = "🟢" if s["action"] == "BUY" else "🔴" if s["action"] == "SELL" else "⚪"
+            msg += f"{emoji} *{s['symbol']}* — {s['action']} | {s['confidence']*100:.0f}%\n_{s['reason'][:80]}_\n\n"
+        await send_telegram(msg, reply_markup=MAIN_MENU)
+
+
 
 # ── Routes — Market ──────────────────────────────────────────────────────────
 @api.get("/")
