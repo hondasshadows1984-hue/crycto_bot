@@ -700,6 +700,9 @@ MAIN_MENU = {
             {"text": "📈 Señales",      "callback_data": "signals"},
         ],
         [
+            {"text": "⚙️ Estado",       "callback_data": "estado"},
+        ],
+        [
             {"text": "⚡ PÁNICO — Cerrar Todo", "callback_data": "panic"},
         ],
     ]
@@ -845,6 +848,26 @@ async def process_telegram_update(update: dict) -> None:
         await send_telegram(msg, reply_markup=MAIN_MENU)
 
 
+
+    elif cb_data == "estado":
+        settings = await get_settings()
+        state    = await get_bot_state()
+        tickers  = await fetch_tickers(settings.symbols)
+        btc      = tickers.get("BTCUSDT", {})
+        status   = "🟢 Corriendo" if state.running else "🔴 Parado"
+        await answer_callback(cb_id, "⚙️ Estado actual")
+        await send_telegram(
+            f"⚙️ *Estado del Bot Crypto*\n\n"
+            f"Estado: {status}\n"
+            f"Modo: {'📄 Paper' if settings.mode == 'paper' else '💰 Real'}\n"
+            f"BTC precio: ${btc.get('price', 0):,.2f}\n"
+            f"BTC cambio 24h: {btc.get('change_pct', 0):+.2f}%\n"
+            f"Pérdida diaria: {state.daily_loss_pct:.2f}% / {settings.circuit_breaker_pct}%\n"
+            f"Circuit breaker: {'🔴 Activo' if state.circuit_breaker_tripped else '🟢 Normal'}\n"
+            f"Último tick: {state.last_tick_at or 'Nunca'}\n"
+            f"Estrategia: {settings.strategy}",
+            reply_markup=MAIN_MENU,
+        )
 
 # ── Routes — Market ──────────────────────────────────────────────────────────
 @api.get("/")
