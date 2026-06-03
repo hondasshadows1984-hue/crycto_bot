@@ -44,6 +44,10 @@ GROQ_API_KEY     = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL       = "llama-3.1-70b-versatile"
 GROQ_API_URL     = "https://api.groq.com/openai/v1/chat/completions"
 
+# Telegram leído directamente de variables de entorno
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT    = os.environ.get("TELEGRAM_CHAT_ID", "")
+
 # Binance Testnet por defecto — cambia a False para usar real
 USE_TESTNET      = os.environ.get("USE_TESTNET", "true").lower() == "true"
 BINANCE_BASE     = "https://testnet.binance.vision" if USE_TESTNET else "https://api.binance.com"
@@ -685,16 +689,19 @@ async def evaluate_open_positions(tickers: dict, settings: Settings) -> List[Pos
 
 # ── Telegram en español ──────────────────────────────────────────────────────
 async def send_telegram(message: str) -> bool:
-    s = await get_settings()
-    if not s.telegram_bot_token or not s.telegram_chat_id:
+    # Lee directo de variables de entorno — no depende de MongoDB
+    token   = TELEGRAM_TOKEN
+    chat_id = TELEGRAM_CHAT
+    if not token or not chat_id:
+        logger.warning("Telegram no configurado — TOKEN o CHAT_ID vacíos")
         return False
-    url = f"https://api.telegram.org/bot{s.telegram_bot_token}/sendMessage"
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.post(
                 url,
                 json={
-                    "chat_id": s.telegram_chat_id,
+                    "chat_id": chat_id,
                     "text": message,
                     "parse_mode": "Markdown",
                 },
